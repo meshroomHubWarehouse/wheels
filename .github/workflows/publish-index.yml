@@ -1,0 +1,46 @@
+name: publish-index
+
+# Rebuild the PEP 503 / PEP 691 index from the repository's Releases
+# and deploy it to GitHub Pages. Runs on demand, whenever a Release changes, and
+# when triggered by a package's build workflow after a publish.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published, edited, released, deleted, unpublished]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-ci.txt
+      - name: Generate index
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/generateIndex.py --out public --repo "${{ github.repository }}"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
