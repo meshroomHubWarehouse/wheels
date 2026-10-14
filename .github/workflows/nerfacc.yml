@@ -1,0 +1,206 @@
+name: nerfacc
+
+# Build a nerfacc wheel with its CUDA extension compiled ahead of time (upstream
+# 0.3.x JIT-compiles it at runtime) with the parameters you choose, then attach
+# it to a Release and refresh the index.
+# Everything package-specific is in build/build_nerfacc.py.
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux:
+        description: Build Linux wheel
+        type: boolean
+        default: true
+      windows:
+        description: Build Windows wheel
+        type: boolean
+        default: true
+      python:
+        description: Python version (e.g. 3.11)
+        type: string
+        default: "3.11"
+        required: true
+      torch:
+        description: Torch version (e.g. 2.5.1)
+        type: string
+        default: "2.5.1"
+        required: true
+      cuda:
+        # for linux must match an nvidia/cuda devel-ubuntu22.04 tag
+        description: CUDA version (e.g. 12.4.1)
+        type: string
+        default: "12.4.1"
+        required: true
+      cudaArch:
+        description: CUDA compute capability list (e.g. 7.5;8.0;8.6)
+        type: string
+        default: "7.5;8.0;8.6;8.9;9.0"
+        required: true
+      version:
+        # the source patch in build/build_nerfacc.py targets the 0.3.x sdists
+        description: nerfacc version on PyPI (e.g. 0.3.3)
+        type: string
+        default: "0.3.3"
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  # Same pin as tiny-cuda-nn. Not the sdist's own setuptools==65.5.0, which
+  # doesn't run on Python 3.12.
+  SETUPTOOLS_VERSION: "69.5.1"
+
+jobs:
+  linux:
+    if: ${{ inputs.linux }}
+    runs-on: ubuntu-22.04
+    # Use official NVIDIA container image with nvcc, cuBLAS, cuRAND, nvrtc, etc.
+    container: nvidia/cuda:${{ inputs.cuda }}-devel-ubuntu22.04
+    steps:
+      - name: Install checkout prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python }}
+      - name: Build wheel
+        env:
+          VERSION: ${{ inputs.version }}
+          TORCH: ${{ inputs.torch }}
+          CUDA: ${{ inputs.cuda }}
+          CUDA_ARCH: ${{ inputs.cudaArch }}
+          OUTPUT_DIR: ${{ github.workspace }}/dist
+        run: python build/build_nerfacc.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-linux
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows:
+    if: ${{ inputs.windows }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python }}
+      # No official CUDA container image exists for Windows, so install it
+      # directly from NVIDIA's own download server.
+      - name: Install CUDA Toolkit
+        if: inputs.cuda != ''
+        env:
+          CUDA: ${{ inputs.cuda }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verParts = $env:CUDA -split '\.'
+          $short = "$($verParts[0]).$($verParts[1])"
+          # cusparse/cusolver/nvrtc are needed even though nerfacc doesn't
+          # use them directly -- PyTorch's own headers (ATen) pull them in.
+          $componentNames = @('nvcc','cudart','nvtx','cublas','cublas_dev','curand','curand_dev','cusparse','cusparse_dev','cusolver','cusolver_dev','nvrtc','nvrtc_dev','thrust','visual_studio_integration')
+          # 'crt' (host_config.h etc.) and 'nvvm' (cicc, the device-code
+          # backend nvcc invokes for every .cu file) used to ship as part of
+          # 'nvcc' but CUDA 13.0 split them into their own installer
+          # components. Neither exists as a separate component pre-13.0, so
+          # only request them there.
+          if ([int]$verParts[0] -ge 13) { $componentNames += @('crt', 'nvvm') }
+          $components = $componentNames | ForEach-Object { "${_}_$short" }
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA/network_installers/cuda_${env:CUDA}_windows_network.exe"
+          $installer = "$env:RUNNER_TEMP\cuda_installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          # No published checksum to pin per-version, so verify the binary is
+          # authentically signed by NVIDIA before running it elevated.
+          $sig = Get-AuthenticodeSignature -FilePath $installer
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'NVIDIA') {
+            throw "CUDA installer failed signature verification: status=$($sig.Status) signer=$($sig.SignerCertificate.Subject)"
+          }
+          $proc = Start-Process -FilePath $installer -ArgumentList (@('-s') + $components) -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "CUDA installer exited with code $($proc.ExitCode)" }
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+          echo "CUDA_HOME=$cudaPath" >> $env:GITHUB_ENV
+          echo "$cudaPath\bin" >> $env:GITHUB_PATH
+      # Locates the MSVC toolchain via vswhere/vcvarsall
+      # and exports its env vars.
+      - name: Setup MSVC environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installPath) { throw 'MSVC C++ build tools not found' }
+          $vcvarsall = Join-Path $installPath 'VC\Auxiliary\Build\vcvarsall.bat'
+          cmd /c "`"$vcvarsall`" x64 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              echo "$($matches[1])=$($matches[2])" >> $env:GITHUB_ENV
+            }
+          }
+      - name: Build wheel
+        env:
+          VERSION: ${{ inputs.version }}
+          TORCH: ${{ inputs.torch }}
+          CUDA: ${{ inputs.cuda }}
+          CUDA_ARCH: ${{ inputs.cudaArch }}
+          OUTPUT_DIR: ${{ github.workspace }}/dist
+        run: python build/build_nerfacc.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-windows
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows]
+    # Still runs if only one OS was built this run 
+    # e.g. a Windows-only rebuild.
+    if: >-
+      always() && (needs.linux.result == 'success' || needs.windows.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      # merge-multiple + pattern: whichever of wheel-linux/wheel-windows exist
+      # this run land together in one flat artifacts/ dir.
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: wheel-*
+          merge-multiple: true
+      - name: Create or update the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          TORCH: ${{ inputs.torch }}
+          CUDA: ${{ inputs.cuda }}
+          CUDA_ARCH: ${{ inputs.cudaArch }}
+        run: |
+          set -euo pipefail
+          pkg="nerfacc"
+          cu="cu$(printf '%s' "${CUDA:-}" | cut -d. -f1-2 | tr -d '.')"
+          pt="pt$(printf '%s' "${TORCH:-}" | cut -d. -f1-2 | tr -d '.')"
+          variant="${cu}-${pt}"
+          releaseTag="${variant}/${pkg}"
+          notes="**nerfacc wheels** (CUDA extension prebuilt, no JIT/nvcc needed at runtime)
+          - **nerfacc**: ${VERSION:-?}
+          - **CUDA**: ${CUDA:-?}
+          - **PyTorch**: ${TORCH:-?}
+          - **setuptools**: ${SETUPTOOLS_VERSION}"
+          find artifacts -name '*.whl' -print
+          gh release view "$releaseTag" >/dev/null 2>&1 || \
+            gh release create "$releaseTag" --notes "$notes"
+          uploadArgs=()
+          for whl in artifacts/*.whl; do
+            uploadArgs+=("$whl#$(basename "$whl") — cuda_arch ${CUDA_ARCH:-?}")
+          done
+          gh release upload "$releaseTag" "${uploadArgs[@]}" --clobber
+      - name: Refresh the package index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run publish-index.yml
