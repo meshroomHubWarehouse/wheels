@@ -1,0 +1,89 @@
+name: rnb-neus2
+
+# Build the pure-Python rnb-neus2 wheel (the pipeline driving the RNb-NeuS2
+# testbed) from a tag of the RNb-NeuS2 repository, then attach it to a Release
+# and refresh the index.
+# Everything package-specific is in build/build_rnb-neus2.py.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: RNb-NeuS2 git tag (e.g. v2.0.3)
+        type: string
+        default: "v2.0.3"
+        required: true
+      repository:
+        description: GitHub repository to build from
+        type: string
+        default: "meshroomHubWarehouse/RNb-NeuS2"
+        required: true
+      python:
+        # Only runs the build: the wheel is py3-none-any.
+        description: Python version used to build (e.g. 3.11)
+        type: string
+        default: "3.11"
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  # One job for every platform: the wheel has no compiled code.
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python }}
+      - name: Build wheel
+        env:
+          TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ inputs.repository }}
+          OUTPUT_DIR: ${{ github.workspace }}/dist
+        run: python build/build_rnb-neus2.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-any
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: wheel-*
+          merge-multiple: true
+      - name: Create or update the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ inputs.repository }}
+        run: |
+          set -euo pipefail
+          # No variant: the wheel does not depend on a CUDA or PyTorch version,
+          # so the package is published at the root of the index.
+          releaseTag="rnb-neus2"
+          notes="**rnb-neus2 wheels** (pure Python, any platform)
+          - **Source**: https://github.com/${REPOSITORY}
+
+          The compiled testbed is distributed separately, in the releases of the RNb-NeuS2 repository."
+          find artifacts -name '*.whl' -print
+          gh release view "$releaseTag" >/dev/null 2>&1 || \
+            gh release create "$releaseTag" --notes "$notes"
+          uploadArgs=()
+          for whl in artifacts/*.whl; do
+            uploadArgs+=("$whl#$(basename "$whl") — ${REPOSITORY}@${TAG}")
+          done
+          gh release upload "$releaseTag" "${uploadArgs[@]}" --clobber
+      - name: Refresh the package index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run publish-index.yml
